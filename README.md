@@ -7,8 +7,8 @@
 SAM 2 needs to be installed first before use. The code requires `python>=3.10`, as well as `torch>=2.5.1` and `torchvision>=0.20.1`. Please follow the instructions [here](https://pytorch.org/get-started/locally/) to install both PyTorch and TorchVision dependencies. You can install SAM 2 on a GPU machine using:
 
 ```bash
-git clone https://github.com/facebookresearch/sam2.git 
-cd sam2
+git clone https://github.com/oritalp/Spectrogram_seg_w_sam2.git 
+cd Spectrogram_seg_w_sam2
 
 pip install -e .
 ```
@@ -34,8 +34,8 @@ Please see [`INSTALL.md`](./INSTALL.md) for FAQs on potential issues and solutio
 First, we need to download a model checkpoint. All the model checkpoints can be downloaded by running:
 
 ```bash
-cd checkpoints && \
-./download_ckpts.sh && \
+cd checkpoints 
+./download_ckpts.sh
 cd ..
 ```
 
