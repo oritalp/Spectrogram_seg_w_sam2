@@ -15,9 +15,9 @@ from sam2.build_sam import build_sam2_video_predictor
 from pathlib import Path
 from clicker import collect_clicks
 import pickle
-from mir_eval.separation import bss_eval_sources
 from scipy.signal import resample
 import scipy.fftpack as fft
+import noisereduce as nr
 
 
 def input2mel(filename, output_dir):
@@ -94,8 +94,8 @@ def input2mel(filename, output_dir):
             cmap="magma",  # Can try also 'jet'
         )
 
-        output_dir_img = output_dir + "_images"
-        output_dir_spec = output_dir + "_np_array"
+        output_dir_img = output_dir  / "images"
+        output_dir_spec = output_dir / "np_arrays"
         os.makedirs(output_dir_spec, exist_ok=True)
         os.makedirs(output_dir_img, exist_ok=True)
 
@@ -200,14 +200,15 @@ def matrix_to_spectrogram(pixel_x, pixel_y, img_height, img_width, time_bins, fr
 
 def calculate_sdr(clean_path, enhanced_path):
     """
-    Calculate Scale-Invariant SDR between clean and enhanced audio signals.
+    Calculate basic SDR between clean and enhanced audio signals without 
+    normalization or alignment adjustments.
     
     Args:
         clean_path (str): Path to the clean audio file
         enhanced_path (str): Path to the enhanced/processed audio file
     
     Returns:
-        float: SI-SDR value in dB
+        float: SDR value in dB
     """
     # Load audio files
     clean_audio, _ = T.load(clean_path)
@@ -219,53 +220,36 @@ def calculate_sdr(clean_path, enhanced_path):
     if enhanced_audio.shape[0] > 1:
         enhanced_audio = torch.mean(enhanced_audio, dim=0, keepdim=True)
     
-    # Match lengths (take shorter length)
+    # Match lengths
     min_len = min(clean_audio.shape[1], enhanced_audio.shape[1])
-    clean_audio = clean_audio[:, :min_len]
-    enhanced_audio = enhanced_audio[:, :min_len]
+    clean_audio = clean_audio[:, :min_len].squeeze()
+    enhanced_audio = enhanced_audio[:, :min_len].squeeze()
     
-    # Remove mean of both signals
-    clean_audio = clean_audio.squeeze() - torch.mean(clean_audio)
-    enhanced_audio = enhanced_audio.squeeze() - torch.mean(enhanced_audio)
+    # Calculate the scaling factor that minimizes the MSE
+    alpha = torch.dot(clean_audio, enhanced_audio) / (torch.dot(clean_audio, clean_audio) + 1e-8)
     
-    # Normalize both signals
-    clean_audio = clean_audio / torch.sqrt(torch.sum(clean_audio ** 2))
-    enhanced_audio = enhanced_audio / torch.sqrt(torch.sum(enhanced_audio ** 2))
+    # Calculate SDR
+    scaled_reference = alpha * clean_audio
+    noise = enhanced_audio - scaled_reference
     
-    # Calculate the scaling factor
-    alpha = torch.dot(clean_audio, enhanced_audio)
-    
-    # Calculate target and noise
-    target = alpha * clean_audio
-    noise = enhanced_audio - target
-    
-    # Calculate SI-SDR
     sdr = 10 * torch.log10(
-        torch.sum(target ** 2) / (torch.sum(noise ** 2) + 1e-8)
+        torch.sum(scaled_reference ** 2) / (torch.sum(noise ** 2) + 1e-8)
     )
     
     return sdr.item()
 
-
-def calculate_stoi(clean_path, enhanced_path):
+def calculate_stoi(clean_path, enhanced_path, debug=False):
     """
     Calculate STOI between clean and enhanced audio signals.
-    
-    Args:
-        clean_path (str): Path to the clean audio file
-        enhanced_path (str): Path to the enhanced/processed audio file
-    
-    Returns:
-        float: STOI score between 0 and 1
     """
-    import numpy as np
-    import torchaudio as T
-    from scipy.signal import resample
-    import scipy.fftpack as fft
 
     # Load audio files
     clean_audio, fs_signal = T.load(clean_path)
     enhanced_audio, _ = T.load(enhanced_path)
+    
+    if debug:
+        print(f"Original shapes - Clean: {clean_audio.shape}, Enhanced: {enhanced_audio.shape}")
+        print(f"Original sample rate: {fs_signal}")
     
     # Convert to mono if stereo
     if clean_audio.shape[0] > 1:
@@ -277,132 +261,224 @@ def calculate_stoi(clean_path, enhanced_path):
     clean = clean_audio.squeeze().numpy()
     enhanced = enhanced_audio.squeeze().numpy()
     
-    # Match lengths (take shorter length)
+    # Remove DC offset
+    clean = clean - np.mean(clean)
+    enhanced = enhanced - np.mean(enhanced)
+    
+    # Normalize signals to have unit energy
+    clean = clean / np.sqrt(np.sum(clean**2))
+    enhanced = enhanced / np.sqrt(np.sum(enhanced**2))
+    
+    if debug:
+        print(f"Signal energies after normalization - Clean: {np.sum(clean**2):.3f}, "
+              f"Enhanced: {np.sum(enhanced**2):.3f}")
+    
+    # Match lengths
     min_len = min(len(clean), len(enhanced))
     clean = clean[:min_len]
     enhanced = enhanced[:min_len]
     
     # Parameters
     fs = 10000  # Target sampling rate
-    N = 256    # DFT length
-    K = 512    # Segment length
-    J = 15     # Number of 1/3 octave bands
+    N = 256     # DFT length
+    K = 384     # Segment length (changed from 512 to match original paper)
+    J = 15      # Number of 1/3 octave bands
+    Beta = -15  # Lower SDR bound
+    dyn_range = 40  # Speech dynamic range in dB
     
     # Resample to 10 kHz if needed
     if fs_signal != fs:
         clean = resample(clean, int(len(clean) * fs / fs_signal))
         enhanced = resample(enhanced, int(len(enhanced) * fs / fs_signal))
     
+    # Short-time segmentation parameters
+    N_frame = 256    # Frame length
+    K_frame = 384    # Total segment length
+    H = N_frame//2   # Hop length
+    
+    # Number of frames
+    num_frames = (len(clean) - K_frame) // H + 1
+    
     # Initialize 1/3 octave band parameters
-    cf = 150 * 2 ** (np.arange(J) / 3)
-    k = np.arange(N/2 + 1)
-    f = k * fs / N
+    cf = 150 * 2**(np.arange(J)/3)  # Center frequencies
+    erb = 24.7 * (4.37 * cf / 1000 + 1)  # Equivalent rectangular bandwidth
     
-    # Set up OBM (Octave Band Matrix)
-    obm = np.zeros((J, len(f)))
-    for i in range(J):
-        f_low = cf[i] * 2 ** (-1/6)
-        f_high = cf[i] * 2 ** (1/6)
-        obm[i, np.logical_and(f >= f_low, f <= f_high)] = 1
+    # Set up analysis and synthesis windows
+    win = np.hanning(N_frame)
+    win = win / np.sqrt(np.sum(win**2))
     
-    # Normalize OBM
-    obm = obm / np.sum(obm, axis=1, keepdims=True)
-    
-    # Hanning window
-    win = np.hanning(K)
-    
-    # Process frames
-    nframes = max(1, len(clean) - K + 1)
-    X = np.zeros((J, nframes))
-    Y = np.zeros((J, nframes))
-    
-    for m in range(nframes):
-        x_seg = clean[m:m+K] * win
-        y_seg = enhanced[m:m+K] * win
+    # Initialize matrices for TF decomposition
+    X = np.zeros((J, num_frames))
+    Y = np.zeros((J, num_frames))
+
+    # Short-time Fourier analysis
+    for frame_idx in range(num_frames):
+        start_idx = frame_idx * H
+        stop_idx = start_idx + N_frame
         
-        X_frame = np.abs(fft.fft(x_seg, N)[:N//2 + 1]) ** 2
-        Y_frame = np.abs(fft.fft(y_seg, N)[:N//2 + 1]) ** 2
+        x_frame = clean[start_idx:stop_idx] * win
+        y_frame = enhanced[start_idx:stop_idx] * win
         
-        X[:, m] = np.sqrt(np.dot(obm, X_frame))
-        Y[:, m] = np.sqrt(np.dot(obm, Y_frame))
+        x_stft = fft.fft(x_frame, N)[:N//2 + 1]
+        y_stft = fft.fft(y_frame, N)[:N//2 + 1]
+        
+        # Power spectra
+        x_power = np.abs(x_stft)**2
+        y_power = np.abs(y_stft)**2
+        
+        # Apply ERB-like weighting
+        for j in range(J):
+            cf_j = cf[j]
+            erb_j = erb[j]
+            
+            # Frequency weighting
+            w = np.exp(-0.5 * ((fs * np.arange(N//2 + 1) / N - cf_j) / (erb_j/2.0))**2)
+            w = w / np.sum(w)
+            
+            # Apply weighting and sum
+            X[j, frame_idx] = np.sqrt(np.sum(x_power * w))
+            Y[j, frame_idx] = np.sqrt(np.sum(y_power * w))
     
-    # Apply threshold
-    c = 5.62341325  # 10^(-Beta/20), with Beta = -15 dB
+    if debug:
+        print(f"TF representation shapes - X: {X.shape}, Y: {Y.shape}")
+    
+    # Normalize representations
+    for j in range(J):
+        X[j, :] = (X[j, :] - np.mean(X[j, :])) / (np.std(X[j, :]) + 1e-8)
+        Y[j, :] = (Y[j, :] - np.mean(Y[j, :])) / (np.std(Y[j, :]) + 1e-8)
+    
+    # Apply intensity clipping
+    c = 10**(Beta/20)
     X = np.maximum(X, c * np.max(X))
     Y = np.maximum(Y, c * np.max(Y))
-    
-    # Compute correlation coefficients
-    d = np.zeros(J)
-    for i in range(J):
-        x = X[i, :]
-        y = Y[i, :]
-        
-        x = (x - np.mean(x)) / (np.std(x) + 1e-8)
-        y = (y - np.mean(y)) / (np.std(y) + 1e-8)
-        
-        d[i] = np.sum(x * y) / len(x)
-    
-    return float(np.mean(d))
 
-def print_quality_metrics(clean_path, noisy_path, enhanced_path):
+    # Compute correlation coefficients for each band
+    d = np.zeros(J)
+    for j in range(J):
+        x = X[j, :]
+        y = Y[j, :]
+        
+        # Compute correlation
+        d[j] = np.sum(x * y) / np.sqrt(np.sum(x**2) * np.sum(y**2) + 1e-8)
+    
+    if debug:
+        print(f"Band-wise correlations: {d}")
+        print(f"Mean correlation: {np.mean(d):.3f}")
+    
+    # Ensure final score is between 0 and 1
+    final_score = float(np.mean(d))
+    final_score = np.clip(final_score, 0.0, 1.0)
+    
+    return final_score
+
+def print_quality_metrics(clean_path, noisy_path, *enhanced_paths, debug=False):
     """
-    Print SDR and STOI comparison between noisy and enhanced audio.
+    Print SDR and STOI comparison between noisy audio and variable number of enhanced audio files.
     
     Args:
-        clean_path (str): Path to the clean audio file
-        noisy_path (str): Path to the noisy audio file
-        enhanced_path (str): Path to the enhanced/processed audio file
+        clean_path (str): Path to the clean reference audio
+        noisy_path (str): Path to the noisy audio
+        *enhanced_paths (str): Variable number of paths to enhanced audio files
+        debug (bool): Boolean flag for additional debug information
     """
+    import os
+    
+    def get_method_name(path):
+        """Extract method name from file path."""
+        basename = os.path.basename(path)  # Get filename from path
+        name = os.path.splitext(basename)[0]  # Remove extension
+        # Replace underscores/hyphens with spaces and capitalize
+        return name.replace('_', ' ').replace('-', ' ').title()
+    
     # Calculate metrics for noisy audio
     print("Calculating metrics for noisy audio...")
     noisy_sdr = calculate_sdr(clean_path, noisy_path)
-    noisy_stoi = calculate_stoi(clean_path, noisy_path)
+    noisy_stoi = calculate_stoi(clean_path, noisy_path, debug=debug)
     
-    # Calculate metrics for enhanced audio
-    print("Calculating metrics for enhanced audio...")
-    enhanced_sdr = calculate_sdr(clean_path, enhanced_path)
-    enhanced_stoi = calculate_stoi(clean_path, enhanced_path)
+    # Calculate metrics for all enhanced audio files
+    enhanced_metrics = []
+    for path in enhanced_paths:
+        method_name = get_method_name(path)
+        print(f"Calculating metrics for {method_name}...")
+        
+        sdr = calculate_sdr(clean_path, path)
+        stoi = calculate_stoi(clean_path, path, debug=debug)
+        sdr_improvement = sdr - noisy_sdr
+        stoi_improvement = stoi - noisy_stoi
+        
+        enhanced_metrics.append({
+            'name': method_name,
+            'sdr': sdr,
+            'stoi': stoi,
+            'sdr_improvement': sdr_improvement,
+            'stoi_improvement': stoi_improvement
+        })
     
-    # Calculate improvements
-    sdr_improvement = enhanced_sdr - noisy_sdr
-    stoi_improvement = enhanced_stoi - noisy_stoi
+    # Calculate maximum name length for proper alignment
+    max_name_length = max(
+        len("Noisy"),
+        max(len(m['name']) for m in enhanced_metrics)
+    ) + 2  # Add minimal padding
     
-    # Print results
+    # Define column widths
+    sdr_width = 8
+    stoi_width = 10
+    improvement_width = 12
+    
+    # Print the table
     print("\nAudio Quality Metrics:")
-    print("-" * 50)
-    print(f"{'Signal':<15} {'SDR (dB)':<12} {'STOI':<10}")
-    print("-" * 50)
-    print(f"{'Noisy':<15} {noisy_sdr:>7.2f}{'dB':>5} {noisy_stoi:>10.3f}")
-    print(f"{'Enhanced':<15} {enhanced_sdr:>7.2f}{'dB':>5} {enhanced_stoi:>10.3f}")
-    print("-" * 50)
-    print(f"{'Improvement':<15} {sdr_improvement:>+7.2f}{'dB':>5} {stoi_improvement:>+10.3f}")
+    print("-" * (max_name_length + sdr_width + stoi_width + 2 * improvement_width + 10))
+    
+    # Headers
+    method_col = f"{{:<{max_name_length}}}"
+    main_header = (
+        f"{method_col}     {'SDR (dB)':<{sdr_width}} {'STOI':<{stoi_width}}     "
+        f"{'Improvement':>{2 * improvement_width}}"
+    ).format("Method")
+    print(main_header)
+    
+    sub_header = (
+        f"{method_col}     {'':>{sdr_width}} {'':>{stoi_width}}     "
+        f"{'SDR (dB)':>{improvement_width}} {'STOI':>{improvement_width}}"
+    ).format("")
+    print(sub_header)
+    
+    print("-" * (max_name_length + sdr_width + stoi_width + 2 * improvement_width + 10))
+    
+    # Print noisy baseline
+    print(
+        f"{method_col}     {noisy_sdr:>6.2f} {'dB':<2} {noisy_stoi:>8.5f}".format("Noisy")
+    )
+    
+    # Print enhanced metrics
+    for metrics in enhanced_metrics:
+        print(
+            f"{method_col}     {metrics['sdr']:>6.2f} {'dB':<2} {metrics['stoi']:>8.5f}     "
+            f"{metrics['sdr_improvement']:>10.2f} {metrics['stoi_improvement']:>12.5f}".format(metrics['name'])
+        )
+    
+    print("-" * (max_name_length + sdr_width + stoi_width + 2 * improvement_width + 10))
 
-# def print_sdr_comparison(clean_path, noisy_path, enhanced_path):
-#     """
-#     Print SDR comparison between noisy and enhanced audio.
+def reduce_noise(input_file, output_file, decrease_factor=0.75):
+    # Load audio using torchaudio
+    waveform, sample_rate = T.load(input_file)
     
-#     Args:
-#         clean_path (str): Path to the clean audio file
-#         noisy_path (str): Path to the noisy audio file
-#         enhanced_path (str): Path to the enhanced/processed audio file
-#     """
-#     # Calculate SDR for noisy audio
-#     print("Calculating SDR for noisy audio...")
-#     noisy_sdr = calculate_sdr(clean_path, noisy_path)
+    # Convert to mono if stereo (torchaudio loads as [channels, samples])
+    if waveform.shape[0] > 1:
+        waveform = torch.mean(waveform, dim=0)
     
-#     # Calculate SDR for enhanced audio
-#     print("Calculating SDR for enhanced audio...")
-#     enhanced_sdr = calculate_sdr(clean_path, enhanced_path)
+    # Convert to numpy array (noisereduce expects numpy)
+    audio_np = waveform.numpy()
     
-#     # Calculate improvement
-#     sdr_improvement = enhanced_sdr - noisy_sdr
+    # Reduce noise - non-stationary mode
+    reduced_noise = nr.reduce_noise(
+        y=audio_np,
+        sr=sample_rate,
+        stationary=False,  # For varying background noise
+        prop_decrease=decrease_factor)
     
-#     # Print results
-#     print("\nSDR Comparison:")
-#     print("-" * 40)
-#     print(f"{'Signal':<15} {'SDR (dB)':<10}")
-#     print("-" * 40)
-#     print(f"{'Noisy':<15} {noisy_sdr:.2f}")
-#     print(f"{'Enhanced':<15} {enhanced_sdr:.2f}")
-#     print("-" * 40)
-#     print(f"{'Improvement':<15} {sdr_improvement:+.2f}")
+    # Convert back to torch tensor for saving
+    reduced_noise_tensor = torch.FloatTensor(reduced_noise)
+    
+    # Save using torchaudio
+    T.save(output_file, reduced_noise_tensor, sample_rate)
