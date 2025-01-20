@@ -20,7 +20,7 @@ import scipy.fftpack as fft
 import noisereduce as nr
 
 
-def input2mel(filename, output_dir):
+def input2mel(filename, output_dir, single_frame):
     # Load the original audio file
     audio, sr = T.load(filename)  # Load audio and sample rate using torchaudio
 
@@ -53,8 +53,10 @@ def input2mel(filename, output_dir):
         'normalized': True,
     }
     mel_spec_transform = TT.MelSpectrogram(**mel_args)
-
-    duration = audio.size(0) / sr
+    if single_frame:
+        duration = audio.size(0) / sr
+    else:
+        duration = 1
     # Calculate the total number of X-second chunks - for better interpretability
     chunk_duration = duration  # Duration in seconds
     chunk_samples = chunk_duration * sr
